@@ -264,7 +264,23 @@ def main():
                 st.write(desc)
 
                 engine = get_engine()
-                with engine.connect() as conn:
+                with engine.begin() as conn:
+                    # get user_id
+                    user_id = conn.execute(
+                        text("SELECT user_id FROM Users WHERE username = :username"),
+                        {"username": st.session_state.username}
+                    ).scalar()
+                    # INSERT 使用者選擇的歌曲
+                    for song_id in selected:
+                        try:
+                            conn.execute(text("""
+                                INSERT INTO User_Selected_Songs (user_id, song_id)
+                                VALUES (:user_id, :song_id)
+                                ON DUPLICATE KEY UPDATE selected_at = CURRENT_TIMESTAMP
+                            """), {"user_id": user_id, "song_id": song_id})
+                        except Exception as e:
+                            st.error(f"更新使用者選擇歌曲時發生錯誤: {e}")
+                    # 取得所選歌曲平均特徵
                     avg_row = pd.read_sql(f"""
                         SELECT AVG(energy) AS energy, AVG(danceability) AS danceability,
                                AVG(positiveness) AS positiveness, AVG(speechiness) AS speechiness,
@@ -273,6 +289,30 @@ def main():
                         FROM Songs WHERE song_id IN ({','.join(str(i) for i in selected)})
                     """, conn).iloc[0]
 
+                    st.write(avg_row)
+
+                    # INSERT 人格結果
+                    try:
+                        conn.execute(text("""
+                            INSERT INTO personality_result 
+                            (user_id, personality_type, avg_energy, avg_danceability, avg_speechiness, avg_acousticness, avg_positiveness, avg_liveness, avg_instrumentalness)
+                            VALUES
+                            (:user_id, :personality_type, :avg_energy, :avg_danceability, :avg_speechiness, :avg_acousticness, :avg_positiveness, :avg_liveness, :avg_instrumentalness)
+                        """), {
+                            "user_id": user_id,
+                            "personality_type": personality,
+                            "avg_energy": avg_row["energy"],
+                            "avg_danceability": avg_row["danceability"],
+                            "avg_speechiness": avg_row["speechiness"],
+                            "avg_acousticness": avg_row["acousticness"],
+                            "avg_positiveness": avg_row["positiveness"],
+                            "avg_liveness": avg_row["liveness"],
+                            "avg_instrumentalness": avg_row["instrumentalness"]
+                        })
+                    except Exception as e:
+                        st.error(f"新增人格結果時發生錯誤: {e}")
+
+                # 雷達圖 & 柱狀圖
                 df_recommended = get_cluster_recommendations()
                 stats = {f"{f}_max": df_recommended[f].max() for f in avg_row.index}
                 stats.update({f"{f}_min": df_recommended[f].min() for f in avg_row.index})
@@ -280,6 +320,7 @@ def main():
 
                 plot_radar_chart_plotly(normalized)
                 plot_personality_match_bar(df_types)
+                
     elif page == "⚙️ 帳號管理":
         st.header("⚙️ 帳號管理")
 
