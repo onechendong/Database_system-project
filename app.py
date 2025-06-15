@@ -1,6 +1,7 @@
 from requests import session
 import streamlit as st
 import pandas as pd
+import urllib.parse
 from sqlalchemy import create_engine, text
 from sklearn.cluster import KMeans
 from sklearn.preprocessing import StandardScaler
@@ -9,7 +10,7 @@ import hashlib
 
 # ---------- 資料庫連線 ----------
 def get_engine():
-    return create_engine("mysql+mysqlconnector://root:877899@localhost/music_db_copy")  # 根據你的環境調整
+    return create_engine("mysql+mysqlconnector://root:877899@localhost/music_db_new")  # 根據你的環境調整
 
 # ---------- 密碼雜湊 ----------
 def hash_password(password):
@@ -35,7 +36,7 @@ def login_user(username, password):
         result = conn.execute(text("SELECT * FROM Users WHERE username = :username AND password_hash = :password_hash"),
                               {"username": username, "password_hash": password_hash})
         return result.fetchone() is not None
-    
+
 # 刪除使用者（需密碼驗證）
 def delete_user(username, password, current_user):
     if username != current_user:
@@ -62,7 +63,6 @@ def show_users():
     with engine.connect() as conn:
         result = conn.execute(text("SELECT username FROM Users"))
         return [row[0] for row in result]
-    
 
 # ---------- 搜尋歌曲 ----------
 def search_songs(keyword, genre, year_range):
@@ -177,6 +177,133 @@ def plot_personality_match_bar(df_types):
     fig.update_layout(title="人格型態相似度分析", xaxis_title="相似度 (%)", yaxis_title="人格型態", height=400)
     st.plotly_chart(fig, use_container_width=True)
 
+# ---------- 靈魂配對 ----------
+def get_compatible_type(my_type, scenario):
+    engine = get_engine()
+    with engine.connect() as conn:
+        result = conn.execute(text("""
+            SELECT compatible_type, description, match_score FROM Personality_Match
+            WHERE personality_type = :my_type AND scenario = :scenario
+            ORDER BY match_score DESC LIMIT 1
+        """), {"my_type": my_type, "scenario": scenario}).fetchone()
+        return result if result else (None, "尚無配對資料", None)
+
+def fetch_matching_users(my_type):
+    engine = get_engine()
+    with engine.connect() as conn:
+        df = pd.read_sql("""
+            SELECT u.username, pr.personality_type FROM Users u
+            JOIN personality_result pr ON u.user_id = pr.user_id
+            WHERE pr.personality_type = %(my_type)s
+        """, conn, params={"my_type": my_type})
+        return df
+
+# ---------- 配對歌單推薦 ----------
+def fetch_common_style_songs(type1, type2):
+    engine = get_engine()
+    with engine.connect() as conn:
+        # 先抓出各自的推薦清單
+        df1 = pd.read_sql(text("""
+            SELECT s.song_id, s.title, s.artist, s.energy, s.danceability, s.positiveness,
+                   s.speechiness, s.liveness, s.acousticness, s.instrumentalness
+            FROM Songs s
+            JOIN Recommended_Songs r ON s.song_id = r.song_id
+            WHERE r.personality_type = :type1
+        """), conn, params={"type1": type1})
+
+        df2 = pd.read_sql(text("""
+            SELECT s.song_id, s.title, s.artist, s.energy, s.danceability, s.positiveness,
+                   s.speechiness, s.liveness, s.acousticness, s.instrumentalness
+            FROM Songs s
+            JOIN Recommended_Songs r ON s.song_id = r.song_id
+            WHERE r.personality_type = :type2
+        """), conn, params={"type2": type2})
+
+    # 找出交集
+    df_common = df1[df1["song_id"].isin(df2["song_id"])]
+
+    if not df_common.empty:
+        df_common = df_common.sample(n=min(10, len(df_common)), random_state=42)
+    else:
+        # 若沒有交集，就找最相似的兩首（type1 的一首 vs type2 的一首）
+        from sklearn.metrics.pairwise import cosine_similarity
+        from sklearn.preprocessing import StandardScaler
+        import numpy as np
+
+        feats = ["energy", "danceability", "positiveness", "speechiness", "liveness", "acousticness", "instrumentalness"]
+        scaler = StandardScaler()
+        df1_scaled = scaler.fit_transform(df1[feats])
+        df2_scaled = scaler.transform(df2[feats])
+        sim = cosine_similarity(df1_scaled, df2_scaled)
+
+        idx1, idx2 = np.unravel_index(np.argmax(sim), sim.shape)
+        df_common = pd.DataFrame([df1.iloc[idx1]])
+
+    # 加入 YouTube 欄位
+    df_common["YouTube"] = df_common.apply(
+        lambda row: f"<a href='https://www.youtube.com/results?search_query={urllib.parse.quote_plus(row['title'] + ' ' + row['artist'])}' target='_blank'>🔗</a>",
+        axis=1
+    )
+    return df_common
+
+def display_soulmate_recommendations(type1, type2, match_score=None):
+    st.subheader(f"為你與「{type2}」類型使用者推薦的靈魂共鳴歌單")
+    df_common = fetch_common_style_songs(type1, type2)
+    if df_common.empty:
+        st.info("暫無共通推薦歌曲")
+        return
+
+    playlist_name = f"{type1} ♡ {type2} 靈魂共振歌單"
+    if match_score is None:
+        message = "你們的旋律共鳴指數突破天際，是音樂宇宙的雙生星座！"
+    elif match_score > 0.9:
+        message = "你們宛如命中注定的旋律夥伴，默契值爆表！"
+    elif match_score > 0.8:
+        message = "你們音樂頻率一致，是彼此最佳拍檔！"
+    elif match_score > 0.7:
+        message = "你們有著穩定的音樂共鳴，值得多多探索！"
+    else:
+        message = "音樂風格雖異，卻可能擦出驚喜火花！"
+
+    st.markdown(f"##### 🎧 **{playlist_name}**")
+    st.caption(message)
+
+    df_display = df_common[["title", "artist", "YouTube"]].rename(columns={
+        "title": "歌曲名稱", "artist": "演出者", "YouTube": "試聽連結"
+    })
+    st.markdown(df_display.to_html(escape=False, index=False), unsafe_allow_html=True)
+
+# ---------- 主畫面整合 ----------
+def show_music_soulmate_section():
+    engine = get_engine()
+    with engine.connect() as conn:
+        result = conn.execute(text("""
+            SELECT personality_type FROM personality_result pr
+            JOIN Users u ON pr.user_id = u.user_id
+            WHERE u.username = :username
+        """), {"username": st.session_state.username}).fetchone()
+
+    if result:
+        st.info(f"你的人格類型：**{result[0]}**")
+    else:
+        st.warning("⚠️ 你尚未進行人格測驗，請先前往『人格推薦』頁面完成測驗")
+    st.header("🎼 音樂靈魂配對系統")
+    my_type = st.selectbox("請選擇你的人格類型：", ["活力開朗型", "派對社交型", "語言思考型", "沉靜內斂型", "療癒放鬆型", "多元探索型"])
+    scenario = st.selectbox("你想要配對的情境是：", ["讀書", "放空", "運動"])
+
+    compatible_type, description, score = get_compatible_type(my_type, scenario)
+    if compatible_type:
+        st.success(f"與你最相容的類型是：**{compatible_type}**")
+        st.caption(description)
+
+        matching_users = fetch_matching_users(compatible_type)
+        if not matching_users.empty:
+            st.write(f"目前有 {len(matching_users)} 位 {compatible_type} 類型的使用者：")
+            st.dataframe(matching_users, use_container_width=True)
+
+        display_soulmate_recommendations(my_type, compatible_type, match_score=score)
+    else:
+        st.info("目前尚無配對建議。")
 # ---------- 主程式 ----------
 def main():
     st.set_page_config(page_title="音樂推薦與人格預測", layout="wide")
@@ -186,7 +313,6 @@ def main():
         st.session_state.logged_in = False
         st.session_state.username = None
 
-    # 尚未登入
     if not st.session_state.logged_in:
         tab1, tab2 = st.tabs(["🔐 登入", "📝 註冊"])
 
@@ -216,35 +342,15 @@ def main():
                     st.warning("請輸入帳號與密碼")
         return
 
-    # 已登入
     st.sidebar.markdown(f"👤 目前使用者：**{st.session_state.username}**")
     if st.sidebar.button("🚪 登出"):
         st.session_state.logged_in = False
         st.session_state.username = None
         st.rerun()
 
-    page = st.sidebar.radio("功能選單", ["🔍 搜尋歌曲", "🎧 人格推薦", "⚙️ 帳號管理"])
+    page = st.sidebar.radio("功能選單", ["🔍 搜尋歌曲", "🎧 人格推薦", "💞 靈魂配對", "⚙️ 帳號管理"])
 
-    if page == "🔍 搜尋歌曲":
-        st.header("🔍 音樂查詢系統")
-        keyword = st.text_input("關鍵字（歌名或歌手）")
-
-        with get_engine().connect() as conn:
-            genre_options = ["全部"] + pd.read_sql("SELECT name FROM Genres ORDER BY name", conn)['name'].dropna().tolist()
-        genre = st.selectbox("音樂類型", genre_options)
-        year_range = st.slider("年代範圍", 1950, 2025, (2000, 2023))
-
-        if st.button("搜尋"):
-            if keyword.strip() == "":
-                st.warning("請輸入關鍵字")
-            else:
-                results = search_songs(keyword, genre, year_range)
-                if results.empty:
-                    st.info("找不到符合條件的歌曲。")
-                else:
-                    st.markdown(results.to_html(escape=False, index=False), unsafe_allow_html=True)
-
-    elif page == "🎧 人格推薦":
+    if page == "🎧 人格推薦":
         st.header("🎧 勾選喜歡的歌曲以預測人格")
         df = get_cluster_recommendations()
         selected = []
@@ -265,12 +371,11 @@ def main():
 
                 engine = get_engine()
                 with engine.begin() as conn:
-                    # get user_id
                     user_id = conn.execute(
                         text("SELECT user_id FROM Users WHERE username = :username"),
                         {"username": st.session_state.username}
                     ).scalar()
-                    # INSERT 使用者選擇的歌曲
+
                     for song_id in selected:
                         try:
                             conn.execute(text("""
@@ -280,7 +385,7 @@ def main():
                             """), {"user_id": user_id, "song_id": song_id})
                         except Exception as e:
                             st.error(f"更新使用者選擇歌曲時發生錯誤: {e}")
-                    # 取得所選歌曲平均特徵
+
                     avg_row = pd.read_sql(f"""
                         SELECT AVG(energy) AS energy, AVG(danceability) AS danceability,
                                AVG(positiveness) AS positiveness, AVG(speechiness) AS speechiness,
@@ -289,30 +394,51 @@ def main():
                         FROM Songs WHERE song_id IN ({','.join(str(i) for i in selected)})
                     """, conn).iloc[0]
 
-                    st.write(avg_row)
+                    feature_map = {
+                        "energy": "活力",
+                        "danceability": "舞動性",
+                        "positiveness": "正向情緒",
+                        "speechiness": "語音成分",
+                        "liveness": "現場感",
+                        "acousticness": "原聲程度",
+                        "instrumentalness": "器樂性"
+                    }
+                    avg_df = pd.DataFrame({
+                        "特徵": [feature_map[k] for k in avg_row.index],
+                        "平均值 (0~1)": avg_row.values
+                    })
+                    st.markdown("### 🔍 你的音樂特徵平均值")
+                    st.dataframe(avg_df.style.format({"平均值 (0~1)": "{:.2f}"}))
 
-                    # INSERT 人格結果
                     try:
                         conn.execute(text("""
                             INSERT INTO personality_result 
                             (user_id, personality_type, avg_energy, avg_danceability, avg_speechiness, avg_acousticness, avg_positiveness, avg_liveness, avg_instrumentalness)
                             VALUES
                             (:user_id, :personality_type, :avg_energy, :avg_danceability, :avg_speechiness, :avg_acousticness, :avg_positiveness, :avg_liveness, :avg_instrumentalness)
+                            ON DUPLICATE KEY UPDATE
+                            personality_type = VALUES(personality_type),
+                            avg_energy = VALUES(avg_energy),
+                            avg_danceability = VALUES(avg_danceability),
+                            avg_speechiness = VALUES(avg_speechiness),
+                            avg_acousticness = VALUES(avg_acousticness),
+                            avg_positiveness = VALUES(avg_positiveness),
+                            avg_liveness = VALUES(avg_liveness),
+                            avg_instrumentalness = VALUES(avg_instrumentalness)
                         """), {
                             "user_id": user_id,
                             "personality_type": personality,
-                            "avg_energy": avg_row["energy"],
-                            "avg_danceability": avg_row["danceability"],
-                            "avg_speechiness": avg_row["speechiness"],
-                            "avg_acousticness": avg_row["acousticness"],
-                            "avg_positiveness": avg_row["positiveness"],
-                            "avg_liveness": avg_row["liveness"],
-                            "avg_instrumentalness": avg_row["instrumentalness"]
+                            "avg_energy": float(avg_row["energy"]),
+                            "avg_danceability": float(avg_row["danceability"]),
+                            "avg_speechiness": float(avg_row["speechiness"]),
+                            "avg_acousticness": float(avg_row["acousticness"]),
+                            "avg_positiveness": float(avg_row["positiveness"]),
+                            "avg_liveness": float(avg_row["liveness"]),
+                            "avg_instrumentalness": float(avg_row["instrumentalness"])
                         })
                     except Exception as e:
                         st.error(f"新增人格結果時發生錯誤: {e}")
 
-                # 雷達圖 & 柱狀圖
                 df_recommended = get_cluster_recommendations()
                 stats = {f"{f}_max": df_recommended[f].max() for f in avg_row.index}
                 stats.update({f"{f}_min": df_recommended[f].min() for f in avg_row.index})
@@ -320,7 +446,26 @@ def main():
 
                 plot_radar_chart_plotly(normalized)
                 plot_personality_match_bar(df_types)
-                
+
+    elif page == "🔍 搜尋歌曲":
+        st.header("🔍 音樂查詢系統")
+        keyword = st.text_input("關鍵字（歌名或歌手）")
+
+        with get_engine().connect() as conn:
+            genre_options = ["全部"] + pd.read_sql("SELECT name FROM Genres ORDER BY name", conn)['name'].dropna().tolist()
+        genre = st.selectbox("音樂類型", genre_options)
+        year_range = st.slider("年代範圍", 1950, 2025, (2000, 2023))
+
+        if st.button("搜尋"):
+            if keyword.strip() == "":
+                st.warning("請輸入關鍵字")
+            else:
+                results = search_songs(keyword, genre, year_range)
+                if results.empty:
+                    st.info("找不到符合條件的歌曲。")
+                else:
+                    st.markdown(results.to_html(escape=False, index=False), unsafe_allow_html=True)
+
     elif page == "⚙️ 帳號管理":
         st.header("⚙️ 帳號管理")
 
@@ -351,6 +496,8 @@ def main():
                 else:
                     st.error(msg)
 
+    elif page == "💞 靈魂配對":
+        show_music_soulmate_section()
 
 if __name__ == "__main__":
     main()
