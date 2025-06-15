@@ -354,20 +354,69 @@ def main():
 
     if page == "🎧 人格推薦":
         st.header("🎧 勾選喜歡的歌曲以預測人格")
-        df = get_cluster_recommendations()
-        selected = []
+
+        # >>> 初始化累積勾選清單（Session State）
+        if "selected_songs" not in st.session_state:
+            st.session_state["selected_songs"] = set()
+
+        if st.button("清空已選歌曲"):
+            # 清空前端勾選集合
+            st.session_state["selected_songs"] = set()
+
+            # 同步刪除資料庫中該使用者已選歌曲紀錄
+            engine = get_engine()
+            with engine.begin() as conn:
+                user_id = conn.execute(
+                    text("SELECT user_id FROM Users WHERE username = :username"),
+                    {"username": st.session_state.username}
+                ).scalar()
+
+                try:
+                    conn.execute(text("DELETE FROM User_Selected_Songs WHERE user_id = :user_id"), {"user_id": user_id})
+                    st.success("已清空所有已選歌曲紀錄")
+                except Exception as e:
+                    st.error(f"清空資料庫選歌紀錄時發生錯誤: {e}")
+
+        # >>> 重新推薦按鈕（會換一批推薦，但保留勾選）
+        if st.button("🔁 重新推薦"):
+            if "cluster_result" in st.session_state:
+                del st.session_state["cluster_result"]
+
+        # >>> 如果沒推薦清單，呼叫推薦函式產生
+        if "cluster_result" not in st.session_state:
+            st.session_state["cluster_result"] = get_cluster_recommendations()
+
+        df = st.session_state["cluster_result"]
+        selected = st.session_state["selected_songs"]
+
+        st.subheader("請勾選你喜歡的歌曲：")
 
         for _, row in df.iterrows():
             col1, col2 = st.columns([0.05, 0.95])
-            if col1.checkbox("", key=row["song_id"]):
-                selected.append(row["song_id"])
+            # >>> checkbox 使用動態 key 避免衝突，並預設為是否已勾選過
+            checked = col1.checkbox(
+                "",
+                key=f"{row['song_id']}_checkbox",
+                value=(row["song_id"] in selected)
+            )
             col2.markdown(f"**{row['title']} - {row['artist']}** [🔗]({row['YouTube']})", unsafe_allow_html=True)
+
+            # >>> 根據勾選狀態更新 session_state 內的累積勾選集合
+            if checked:
+                selected.add(row["song_id"])
+            else:
+                selected.discard(row["song_id"])
+
+        # >>> 顯示目前累積選取的歌曲數
+        st.info(f"目前累積選取了 {len(selected)} 首歌")
 
         if st.button("送出喜好"):
             if not selected:
                 st.warning("請至少選一首歌")
             else:
-                personality, desc, df_types = infer_personality(selected)
+                selected_list = list(selected)
+
+                personality, desc, df_types = infer_personality(selected_list)
                 st.success(f"你可能的人格型態是：**{personality}**")
                 st.write(desc)
 
@@ -378,7 +427,7 @@ def main():
                         {"username": st.session_state.username}
                     ).scalar()
 
-                    for song_id in selected:
+                    for song_id in selected_list:
                         try:
                             conn.execute(text("""
                                 INSERT INTO User_Selected_Songs (user_id, song_id)
@@ -390,10 +439,10 @@ def main():
 
                     avg_row = pd.read_sql(f"""
                         SELECT AVG(energy) AS energy, AVG(danceability) AS danceability,
-                               AVG(positiveness) AS positiveness, AVG(speechiness) AS speechiness,
-                               AVG(liveness) AS liveness, AVG(acousticness) AS acousticness,
-                               AVG(instrumentalness) AS instrumentalness
-                        FROM Songs WHERE song_id IN ({','.join(str(i) for i in selected)})
+                            AVG(positiveness) AS positiveness, AVG(speechiness) AS speechiness,
+                            AVG(liveness) AS liveness, AVG(acousticness) AS acousticness,
+                            AVG(instrumentalness) AS instrumentalness
+                        FROM Songs WHERE song_id IN ({','.join(str(i) for i in selected_list)})
                     """, conn).iloc[0]
 
                     feature_map = {
