@@ -7,6 +7,7 @@ from sklearn.cluster import KMeans
 from sklearn.preprocessing import StandardScaler
 import plotly.graph_objects as go
 import hashlib
+import time
 
 # ---------- 資料庫連線 ----------
 def get_engine():
@@ -110,7 +111,8 @@ def get_cluster_recommendations():
     X = scaler.fit_transform(df_all[features])
     df_all["cluster"] = KMeans(n_clusters=10, random_state=42).fit_predict(X)
 
-    sampled = df_all.groupby("cluster").apply(lambda g: g.sample(1, random_state=42)).reset_index(drop=True)
+    seed = int(time.time())  # 每秒會變動
+    sampled = df_all.groupby("cluster").apply(lambda g: g.sample(1, random_state=seed)).reset_index(drop=True)
     sampled["YouTube"] = sampled.apply(
         lambda row: f"https://www.youtube.com/results?search_query={'+'.join(row['title'].split())}+{'+'.join(row['artist'].split())}",
         axis=1
